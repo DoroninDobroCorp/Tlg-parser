@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Автоматический скриншотер для длинных чатов Telegram.
+
+Позволяет делать серию скриншотов выбранной области окна Telegram
+с автоматической прокруткой и определением конца чата.
+"""
 from __future__ import annotations
 import argparse
 import os
@@ -35,6 +40,12 @@ else:
 
 
 class CaptureController:
+    """Контроллер для захвата скриншотов и автопрокрутки.
+    
+    Управляет процессом автоматического скриншота окна Telegram
+    с определением области захвата и автоматической прокруткой.
+    """
+    
     def __init__(self,
                  output_dir: str,
                  scroll_amount: int = 800,
@@ -44,6 +55,18 @@ class CaptureController:
                  extra_retries: int = 2,
                  retry_factor: float = 0.4,
                  bottom_wait: float = 0.4):
+        """Инициализирует контроллер захвата.
+        
+        Args:
+            output_dir: Директория для сохранения скриншотов
+            scroll_amount: Величина прокрутки в пикселях
+            interval: Задержка между захватами в секундах
+            hash_threshold: Порог схожести изображений (0-2)
+            patience: Количество попыток без изменений до остановки
+            extra_retries: Дополнительные попытки микропрокрутки
+            retry_factor: Коэффициент уменьшения прокрутки при retry
+            bottom_wait: Пауза перед дополнительными попытками
+        """
         self.output_dir = output_dir
         self.scroll_amount = scroll_amount
         self.interval = interval
@@ -53,150 +76,249 @@ class CaptureController:
         self.retry_factor = retry_factor
         self.bottom_wait = bottom_wait
 
-        self._tl: Optional[Tuple[int, int]] = None
-        self._br: Optional[Tuple[int, int]] = None
-        self._roi: Optional[Tuple[int, int, int, int]] = None  # left, top, width, height
+        self._tl: Optional[Tuple[int, int]] = None  # Top-left corner
+        self._br: Optional[Tuple[int, int]] = None  # Bottom-right corner
+        self._roi: Optional[Tuple[int, int, int, int]] = None  # Region of interest (left, top, width, height)
 
         self._stop_event = threading.Event()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._capture_count = 0  # Счетчик захваченных кадров
 
         os.makedirs(self.output_dir, exist_ok=True)
+        logging.info(f"Директория для скриншотов: {os.path.abspath(self.output_dir)}")
 
     def _require_pyauto(self):
+        """Проверяет наличие необходимых зависимостей."""
         if pyautogui is None or Image is None or imagehash is None:
-            raise RuntimeError(f"Не установлены зависимости: {repr(_import_error)}")
+            raise RuntimeError(
+                f"Не установлены необходимые зависимости: {repr(_import_error)}\n"
+                f"Установите: pip install pyautogui pillow imagehash"
+            )
 
     def set_top_left(self):
+        """Устанавливает верхний левый угол области захвата по позиции курсора."""
         self._require_pyauto()
         x, y = pyautogui.position()
         self._tl = (int(x), int(y))
-        logging.info(f"Точка верхний-левый: {self._tl}")
+        logging.info(f"✓ Верхний левый угол установлен: {self._tl}")
         self._update_roi_if_ready()
 
     def set_bottom_right(self):
+        """Устанавливает нижний правый угол области захвата по позиции курсора."""
         self._require_pyauto()
         x, y = pyautogui.position()
         self._br = (int(x), int(y))
-        logging.info(f"Точка нижний-правый: {self._br}")
+        logging.info(f"✓ Нижний правый угол установлен: {self._br}")
         self._update_roi_if_ready()
 
     def _update_roi_if_ready(self):
+        """Обновляет область захвата (ROI), если обе точки установлены."""
         if self._tl and self._br:
             x1, y1 = self._tl
             x2, y2 = self._br
             left, top = min(x1, x2), min(y1, y2)
             width, height = abs(x2 - x1), abs(y2 - y1)
+            
             if width < 20 or height < 20:
-                logging.warning("Слишком маленькая область. Выберите заново.")
+                logging.warning(
+                    f"⚠ Слишком маленькая область ({width}x{height}px). "
+                    f"Минимум 20x20px. Выберите заново."
+                )
                 return
+            
             self._roi = (left, top, width, height)
-            logging.info(f"Выбрана область ROI: left={left}, top={top}, width={width}, height={height}")
+            logging.info(
+                f"✓ Область захвата установлена:\n"
+                f"  Координаты: ({left}, {top})\n"
+                f"  Размер: {width}x{height}px\n"
+                f"  Готово к запуску (используйте горячую клавишу G)"
+            )
 
     def start(self):
+        """Запускает процесс захвата скриншотов и автопрокрутки."""
         if self._running:
-            logging.info("Уже запущено")
+            logging.info("⚠ Процесс уже запущен")
             return
         if not self._roi:
-            logging.error("Сначала задайте область (Ctrl+Alt+1 затем Ctrl+Alt+2 над окном Telegram)")
+            logging.error(
+                "⚠ Сначала задайте область захвата:\n"
+                "  1. Наведите курсор на верхний левый угол и нажмите горячую клавишу (1)\n"
+                "  2. Наведите курсор на нижний правый угол и нажмите горячую клавишу (2)"
+            )
             return
+        
         self._stop_event.clear()
         self._running = True
+        self._capture_count = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logging.info("Старт захвата скриншотов...")
+        logging.info("="*60)
+        logging.info("🚀 ЗАПУСК ЗАХВАТА СКРИНШОТОВ")
+        logging.info(f"  Директория: {self.output_dir}")
+        logging.info(f"  Прокрутка: {self.scroll_amount}px")
+        logging.info(f"  Интервал: {self.interval}s")
+        logging.info("="*60)
 
     def stop(self):
+        """Останавливает процесс захвата."""
         if not self._running:
-            logging.info("Не запущено")
+            logging.info("⚠ Процесс не запущен")
             return
+        
+        logging.info("⏸ Остановка захвата...")
         self._stop_event.set()
+        
         if self._thread:
             try:
                 self._thread.join(timeout=5)
             except KeyboardInterrupt:
                 # Игнорируем, завершаем как есть
                 pass
+        
         self._running = False
-        logging.info("Остановлено")
+        logging.info("="*60)
+        logging.info("✓ ЗАХВАТ ОСТАНОВЛЕН")
+        logging.info(f"  Всего кадров: {self._capture_count}")
+        logging.info(f"  Сохранено в: {os.path.abspath(self.output_dir)}")
+        logging.info("="*60)
 
     def _capture_once(self, idx: int) -> Image.Image:
+        """Делает один скриншот выбранной области.
+        
+        Args:
+            idx: Индекс кадра для имени файла
+            
+        Returns:
+            Захваченное изображение PIL
+        """
         assert self._roi is not None
         left, top, width, height = self._roi
-        img = pyautogui.screenshot(region=(left, top, width, height))
-        filepath = os.path.join(self.output_dir, f"frame_{idx:05d}.png")
-        img.save(filepath)
-        logging.debug(f"Сохранено: {filepath}")
-        return img
+        
+        try:
+            img = pyautogui.screenshot(region=(left, top, width, height))
+            filepath = os.path.join(self.output_dir, f"frame_{idx:05d}.png")
+            img.save(filepath)
+            self._capture_count += 1
+            logging.debug(f"📸 Сохранено: frame_{idx:05d}.png")
+            return img
+        except Exception as e:
+            logging.error(f"Ошибка при захвате скриншота #{idx}: {e}")
+            raise
 
     def _scroll_down(self, amount: Optional[int] = None):
+        """Прокручивает область вниз.
+        
+        Args:
+            amount: Величина прокрутки (None = использовать self.scroll_amount)
+        """
         assert self._roi is not None
         left, top, width, height = self._roi
         cx = left + width // 2
-        cy = top + int(height * 0.8)
+        cy = top + int(height * 0.8)  # Прокручиваем в нижней части области
         current_pos = pyautogui.position()
+        
         try:
             pyautogui.moveTo(cx, cy, duration=0.05)
             amt = abs(self.scroll_amount) if amount is None else abs(int(amount))
             pyautogui.scroll(-amt)
+            logging.debug(f"⬇ Прокрутка: {amt}px")
+        except Exception as e:
+            logging.error(f"Ошибка при прокрутке: {e}")
         finally:
-            pyautogui.moveTo(current_pos.x, current_pos.y, duration=0.0)
+            # Возвращаем курсор на место
+            try:
+                pyautogui.moveTo(current_pos.x, current_pos.y, duration=0.0)
+            except:
+                pass
 
     def _images_similar(self, h1, h2) -> bool:
-        # Считаем одинаковыми, если расстояние Хэмминга <= threshold
-        return h1 - h2 <= self.hash_threshold
+        """Проверяет схожесть двух изображений по perceptual hash.
+        
+        Args:
+            h1, h2: perceptual hash изображений (ImageHash)
+            
+        Returns:
+            True если изображения похожи (расстояние <= threshold)
+        """
+        distance = h1 - h2
+        return distance <= self.hash_threshold
 
     def _run_loop(self):
+        """Основной цикл захвата и прокрутки."""
         self._require_pyauto()
         idx = 0
         last_hash = None
         no_change = 0
 
-        # Первичный кадр
-        img = self._capture_once(idx)
-        last_hash = imagehash.phash(img)
-        idx += 1
-
-        while not self._stop_event.is_set():
-            # Основной скролл и снимок
-            self._scroll_down()
-            time.sleep(self.interval)
+        try:
+            # Первичный кадр
+            logging.info("📸 Захват начального кадра...")
             img = self._capture_once(idx)
-            h = imagehash.phash(img)
+            last_hash = imagehash.phash(img)
+            idx += 1
 
-            if self._images_similar(h, last_hash):
-                no_change += 1
-                logging.info(f"Нет изменений ({no_change}/{self.patience}) — возможно достигнут конец чата")
+            while not self._stop_event.is_set():
+                # Основной скролл и снимок
+                self._scroll_down()
+                time.sleep(self.interval)
+                img = self._capture_once(idx)
+                h = imagehash.phash(img)
 
-                # Попробуем дополнительные мелкие прокрутки, вдруг контент подгружается или упёрлись в низ
-                retry_success = False
-                if self.extra_retries > 0:
-                    time.sleep(self.bottom_wait)
-                    for r in range(1, self.extra_retries + 1):
-                        reduced = max(1, int(self.scroll_amount * (self.retry_factor ** r)))
-                        logging.debug(f"Доп. попытка прокрутки #{r}: {reduced} пикс")
-                        self._scroll_down(reduced)
-                        time.sleep(self.interval)
-                        img_retry = self._capture_once(idx)
-                        h_retry = imagehash.phash(img_retry)
-                        idx += 1
-                        if not self._images_similar(h_retry, last_hash):
-                            logging.info("Найдены изменения после доп. прокрутки — продолжаю")
-                            no_change = 0
-                            last_hash = h_retry
-                            retry_success = True
+                if self._images_similar(h, last_hash):
+                    no_change += 1
+                    logging.info(
+                        f"⏸ Нет изменений ({no_change}/{self.patience}) — "
+                        f"возможно достигнут конец чата"
+                    )
+
+                    # Попробуем дополнительные мелкие прокрутки
+                    retry_success = False
+                    if self.extra_retries > 0:
+                        time.sleep(self.bottom_wait)
+                        logging.debug(
+                            f"Пробую {self.extra_retries} дополнительных прокруток "
+                            f"с уменьшенным шагом..."
+                        )
+                        
+                        for r in range(1, self.extra_retries + 1):
+                            reduced = max(1, int(self.scroll_amount * (self.retry_factor ** r)))
+                            logging.debug(f"  Попытка #{r}: прокрутка {reduced}px")
+                            self._scroll_down(reduced)
+                            time.sleep(self.interval)
+                            img_retry = self._capture_once(idx)
+                            h_retry = imagehash.phash(img_retry)
+                            idx += 1
+                            
+                            if not self._images_similar(h_retry, last_hash):
+                                logging.info("✓ Найдены изменения после доп. прокрутки — продолжаю")
+                                no_change = 0
+                                last_hash = h_retry
+                                retry_success = True
+                                break
+                    
+                    if not retry_success:
+                        # Если все доп. попытки безрезультатны
+                        if no_change >= self.patience:
+                            logging.info(
+                                f"✓ Достигнут конец чата: {no_change} попыток без изменений. "
+                                f"Останавливаюсь."
+                            )
                             break
-                if not retry_success:
-                    # Если все доп. попытки безрезультатны — считаем низ достигнут
-                    if no_change >= self.patience:
-                        logging.info("Достигнут конец: доп. прокрутки изменений не дали. Останавливаюсь.")
-                        break
-            else:
-                no_change = 0
-                last_hash = h
-                idx += 1
+                else:
+                    no_change = 0
+                    last_hash = h
+                    idx += 1
+                    
+                    # Периодически выводим прогресс
+                    if idx % 20 == 0:
+                        logging.info(f"📊 Захвачено кадров: {self._capture_count}")
 
-        self._running = False
+        except Exception as e:
+            logging.error(f"Критическая ошибка в цикле захвата: {e}", exc_info=True)
+        finally:
+            self._running = False
+            logging.info(f"✓ Цикл захвата завершен. Всего кадров: {self._capture_count}")
 
 
 def parse_args():

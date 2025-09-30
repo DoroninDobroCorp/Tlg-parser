@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Скрипт для пересылки всех сообщений из одного Telegram чата в другой."""
 from __future__ import annotations
 import argparse
 import asyncio
@@ -16,7 +17,7 @@ except Exception:
 
 try:
     from telethon import TelegramClient
-    from telethon.errors import RPCError
+    from telethon.errors import RPCError, FloodWaitError, ChatWriteForbiddenError
     from telethon.tl.types import InputPeerChannel, InputPeerChat
 except Exception as e:
     TelegramClient = None  # type: ignore
@@ -56,61 +57,177 @@ def parse_date(s: Optional[str]) -> Optional[datetime]:
 
 
 async def resolve_peer(client: TelegramClient, ref: str):
-    if ref.isdigit():
-        return await client.get_entity(int(ref))
-    return await client.get_entity(ref)
+    """Разрешает ссылку на чат/канал в entity."""
+    try:
+        if ref.isdigit():
+            return await client.get_entity(int(ref))
+        return await client.get_entity(ref)
+    except Exception as e:
+        logging.error(f"Не удалось найти чат/канал '{ref}': {e}")
+        raise
 
 
 async def forward_all(args):
+    """Основная функция пересылки сообщений."""
     assert TelegramClient is not None
-    client = TelegramClient(args.session, args.api_id, args.api_hash)
-    await client.start()
-
+    
     if not args.source or not args.target:
         logging.error("Нужно указать --source и --target")
         return 2
-
-    src = await resolve_peer(client, args.source)
-    dst = await resolve_peer(client, args.target)
-
-    date_from = parse_date(args.from_date)
-    date_to = parse_date(args.to_date)
-
-    count = 0
-    async for msg in client.iter_messages(
-        src,
-        limit=args.limit,
-        reverse=args.reverse,
-        offset_date=None,
-    ):
-        # Фильтр по датам
-        if date_from and msg.date and msg.date.replace(tzinfo=None) < date_from:
-            continue
-        if date_to and msg.date and msg.date.replace(tzinfo=None) > date_to:
-            continue
-
-        count += 1
-        if args.dry_run:
-            logging.info(f"DRY: message_id={msg.id} date={msg.date} text={(msg.message or '')[:40]!r}")
-            continue
-
-        try:
-            if args.no_forward:
-                # Копируем содержимое
-                if msg.media:
-                    await client.send_file(dst, msg.media, caption=msg.message or "")
-                else:
-                    if msg.message:
+    
+    client = TelegramClient(args.session, args.api_id, args.api_hash)
+    
+    try:
+        await client.start()
+        logging.info("✓ Успешное подключение к Telegram")
+        
+        # Получаем информацию о чатах
+        logging.info(f"Разрешаю источник: {args.source}")
+        src = await resolve_peer(client, args.source)
+        logging.info(f"✓ Найден источник: {getattr(src, 'title', getattr(src, 'username', str(src.id)))}")
+        
+        logging.info(f"Разрешаю получателя: {args.target}")
+        dst = await resolve_peer(client, args.target)
+        logging.info(f"✓ Найден получатель: {getattr(dst, 'title', getattr(dst, 'username', str(dst.id)))}")
+        
+        date_from = parse_date(args.from_date)
+        date_to = parse_date(args.to_date)
+        
+        if date_from:
+            logging.info(f"Фильтр: сообщения с {date_from.strftime('%Y-%m-%d')}")
+        if date_to:
+            logging.info(f"Фильтр: сообщения до {date_to.strftime('%Y-%m-%d')}")
+        
+        # Подсчитываем общее количество сообщений для progress bar
+        total_count = 0
+        logging.info("Подсчитываем общее количество сообщений...")
+        async for msg in client.iter_messages(src, limit=args.limit, reverse=args.reverse):
+            if date_from and msg.date and msg.date.replace(tzinfo=None) < date_from:
+                continue
+            if date_to and msg.date and msg.date.replace(tzinfo=None) > date_to:
+                continue
+            total_count += 1
+        
+        logging.info(f"Всего сообщений для обработки: {total_count}")
+        
+        if total_count == 0:
+            logging.warning("Нет сообщений для обработки")
+            return 0
+        
+        # Пересылаем сообщения
+        count = 0
+        success_count = 0
+        error_count = 0
+        skipped_count = 0
+        
+        async for msg in client.iter_messages(
+            src,
+            limit=args.limit,
+            reverse=args.reverse,
+            offset_date=None,
+        ):
+            # Фильтр по датам
+            if date_from and msg.date and msg.date.replace(tzinfo=None) < date_from:
+                skipped_count += 1
+                continue
+            if date_to and msg.date and msg.date.replace(tzinfo=None) > date_to:
+                skipped_count += 1
+                continue
+            
+            count += 1
+            progress = (count / total_count * 100) if total_count > 0 else 0
+            
+            if args.dry_run:
+                msg_preview = (msg.message or '')[:50].replace('\n', ' ') if msg.message else '<медиа>'
+                logging.info(
+                    f"[{count}/{total_count}] ({progress:.1f}%) DRY: "
+                    f"msg_id={msg.id} date={msg.date} text={msg_preview!r}"
+                )
+                success_count += 1
+                continue
+            
+            try:
+                if args.no_forward:
+                    # Копируем содержимое от своего имени
+                    if msg.media:
+                        await client.send_file(dst, msg.media, caption=msg.message or "")
+                    elif msg.message:
                         await client.send_message(dst, msg.message)
-            else:
-                # Нативная пересылка (с сохранением автора)
-                await client.forward_messages(dst, msg)
-        except RPCError as e:
-            logging.error(f"Ошибка при отправке msg_id={msg.id}: {e}")
-            await asyncio.sleep(1)
-
-    logging.info(f"Готово. Обработано сообщений: {count}")
-    return 0
+                    else:
+                        # Пустое сообщение (например, только стикер/реакция)
+                        skipped_count += 1
+                        logging.debug(f"Пропущено пустое сообщение msg_id={msg.id}")
+                        continue
+                else:
+                    # Нативная пересылка (с сохранением автора)
+                    await client.forward_messages(dst, msg)
+                
+                success_count += 1
+                if count % 10 == 0 or count == total_count:
+                    logging.info(
+                        f"[{count}/{total_count}] ({progress:.1f}%) ✓ Переслано успешно | "
+                        f"Успешно: {success_count}, Ошибок: {error_count}, Пропущено: {skipped_count}"
+                    )
+                    
+            except FloodWaitError as e:
+                wait_seconds = e.seconds
+                logging.warning(
+                    f"FloodWait: нужно подождать {wait_seconds} секунд. "
+                    f"Пауза... (msg_id={msg.id})"
+                )
+                await asyncio.sleep(wait_seconds + 1)
+                # Повторная попытка
+                try:
+                    if args.no_forward:
+                        if msg.media:
+                            await client.send_file(dst, msg.media, caption=msg.message or "")
+                        elif msg.message:
+                            await client.send_message(dst, msg.message)
+                    else:
+                        await client.forward_messages(dst, msg)
+                    success_count += 1
+                except Exception as retry_err:
+                    error_count += 1
+                    logging.error(f"Ошибка при повторной отправке msg_id={msg.id}: {retry_err}")
+                    
+            except ChatWriteForbiddenError as e:
+                error_count += 1
+                logging.error(
+                    f"Нет прав на запись в целевой чат! msg_id={msg.id}: {e}\n"
+                    f"Проверьте, что вы администратор или участник канала/группы."
+                )
+                # Продолжаем попытки или прерываем?
+                if error_count > 5:
+                    logging.error("Слишком много ошибок записи. Останавливаюсь.")
+                    break
+                    
+            except RPCError as e:
+                error_count += 1
+                logging.error(f"RPC ошибка при отправке msg_id={msg.id}: {e}")
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                error_count += 1
+                logging.error(f"Неожиданная ошибка при отправке msg_id={msg.id}: {e}")
+                await asyncio.sleep(1)
+        
+        # Итоговая статистика
+        logging.info("="*60)
+        logging.info("ИТОГОВАЯ СТАТИСТИКА:")
+        logging.info(f"  Всего обработано: {count}")
+        logging.info(f"  ✓ Успешно: {success_count}")
+        logging.info(f"  ✗ Ошибок: {error_count}")
+        logging.info(f"  ⊘ Пропущено: {skipped_count}")
+        logging.info("="*60)
+        
+        return 0 if error_count == 0 else 1
+        
+    except Exception as e:
+        logging.error(f"Критическая ошибка: {e}", exc_info=True)
+        return 1
+    finally:
+        await client.disconnect()
+        logging.info("Отключение от Telegram")
 
 
 async def main_async(args):
