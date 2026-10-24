@@ -33,6 +33,7 @@ try:
         InputPeerChannel,
         InputPeerChat,
         Message,
+        MessageMediaWebPage,
         MessageService,
     )
 except Exception as e:
@@ -301,7 +302,7 @@ async def forward_batch(
     """
     msg_ids = [m.id for m in messages_batch]
     try:
-        await client.forward_messages(dst, messages_batch)
+        await client.forward_messages(dst, messages_batch, from_peer=src)
         last_id = msg_ids[-1]
         save_checkpoint(
             checkpoint_file,
@@ -313,6 +314,9 @@ async def forward_batch(
             },
         )
         return len(messages_batch), 0
+    except (FloodWaitError, ChatWriteForbiddenError):
+        # Системные ошибки лимитов и прав должны обрабатываться на верхнем уровне
+        raise
     except Exception as e:
         logging.warning(
             f"Ошибка при батч-пересылке {len(messages_batch)} сообщений: {e}. "
@@ -322,7 +326,7 @@ async def forward_batch(
         batch_errors = 0
         for single_msg in messages_batch:
             try:
-                await client.forward_messages(dst, single_msg)
+                await client.forward_messages(dst, single_msg, from_peer=src)
                 batch_success += 1
                 save_checkpoint(
                     checkpoint_file,
@@ -333,6 +337,8 @@ async def forward_batch(
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     },
                 )
+            except (FloodWaitError, ChatWriteForbiddenError):
+                raise
             except Exception as single_err:
                 batch_errors += 1
                 logging.error(f"Не удалось переслать msg_id={single_msg.id}: {single_err}")
@@ -498,8 +504,17 @@ async def forward_all(args):
                 sent = False
                 while not sent:
                     try:
-                        if msg.media:
-                            await client.send_file(dst, msg.media, caption=msg.message or "")
+                        # WebPage previews не являются медиа-файлами для send_file
+                        has_real_media = msg.media and not isinstance(msg.media, MessageMediaWebPage)
+
+                        if has_real_media:
+                            caption_text = msg.message or ""
+                            # Лимит длины подписи к медиа в Telegram - 1024 символа
+                            if len(caption_text) <= 1024:
+                                await client.send_file(dst, msg.media, caption=caption_text)
+                            else:
+                                await client.send_file(dst, msg.media, caption=caption_text[:1024])
+                                await client.send_message(dst, caption_text[1024:])
                         elif msg.message:
                             await client.send_message(dst, msg.message)
                         else:
@@ -619,7 +634,7 @@ async def main_async(args):
             return cli_val
         if env_var in os.environ and os.environ[env_var].strip():
             return os.environ[env_var].strip()
-        if cfg_key in cfg:
+        if cfg_key in cfg and cfg[cfg_key] is not None:
             return cfg[cfg_key]
         return default
 
@@ -643,6 +658,14 @@ async def main_async(args):
 
     args.from_date = resolve_val(args.from_date, "TG_FROM_DATE", "from_date")
     args.to_date = resolve_val(args.to_date, "TG_TO_DATE", "to_date")
+    try:
+        if args.from_date:
+            parse_date_start(args.from_date)
+        if args.to_date:
+            parse_date_end(args.to_date)
+    except ValueError as e:
+        logging.error(str(e))
+        return 2
     args.delay = resolve_val(args.delay, "TG_DELAY", "delay", 1.0)
     if args.delay is not None:
         args.delay = float(args.delay)

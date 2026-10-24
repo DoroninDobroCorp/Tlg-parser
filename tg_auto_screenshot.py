@@ -83,6 +83,7 @@ class CaptureController:
 
         self._stop_event = threading.Event()
         self._running = False
+        self._cleaned_up = False
         self._thread: Optional[threading.Thread] = None
         self._capture_count = 0
         self._start_time: Optional[float] = None
@@ -162,15 +163,18 @@ class CaptureController:
         scale_y = full_img.height / screen_h if screen_h > 0 else 1.0
 
         if abs(scale_x - 1.0) > 0.05 or abs(scale_y - 1.0) > 0.05:
-            # Retina / HiDPI масштабирование координат
-            crop_box = (
-                int(round(left * scale_x)),
-                int(round(top * scale_y)),
-                int(round((left + width) * scale_x)),
-                int(round((top + height) * scale_y)),
-            )
+            # Retina / HiDPI масштабирование координат с защитой от выхода за границы
+            x1 = max(0, min(full_img.width - 1, int(round(left * scale_x))))
+            y1 = max(0, min(full_img.height - 1, int(round(top * scale_y))))
+            x2 = max(x1 + 1, min(full_img.width, int(round((left + width) * scale_x))))
+            y2 = max(y1 + 1, min(full_img.height, int(round((top + height) * scale_y))))
+            crop_box = (x1, y1, x2, y2)
         else:
-            crop_box = (left, top, left + width, top + height)
+            x1 = max(0, min(full_img.width - 1, left))
+            y1 = max(0, min(full_img.height - 1, top))
+            x2 = max(x1 + 1, min(full_img.width, left + width))
+            y2 = max(y1 + 1, min(full_img.height, top + height))
+            crop_box = (x1, y1, x2, y2)
 
         return full_img.crop(crop_box)
 
@@ -225,7 +229,7 @@ class CaptureController:
 
         self._stop_event.clear()
         self._running = True
-        self._capture_count = 0
+        self._cleaned_up = False
         self._start_time = time.time()
 
         try:
@@ -256,6 +260,15 @@ class CaptureController:
         if self._thread and self._thread != threading.current_thread():
             self._thread.join(timeout=3.0)
 
+        self._cleanup()
+
+    def _cleanup(self):
+        """Завершает процесс захвата, восстанавливает курсор и сохраняет метаданные."""
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._running = False
+
         # Возвращаем курсор на исходное место
         if self._saved_cursor_pos:
             try:
@@ -263,7 +276,6 @@ class CaptureController:
             except Exception:
                 pass
 
-        self._running = False
         duration = round(time.time() - self._start_time, 1) if self._start_time else 0.0
 
         # Сохраняем метаданные запуска
@@ -303,7 +315,7 @@ class CaptureController:
     def _run_loop(self):
         """Основной цикл захвата, прокрутки и определения конца чата."""
         self._require_dependencies()
-        frame_idx = 0
+        frame_idx = self._capture_count
         no_change = 0
 
         try:
@@ -378,7 +390,7 @@ class CaptureController:
         except Exception as e:
             logging.error(f"Критическая ошибка в процессе захвата: {e}", exc_info=True)
         finally:
-            self._running = False
+            self._cleanup()
 
 
 def parse_args():
