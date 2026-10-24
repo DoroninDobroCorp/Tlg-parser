@@ -1,0 +1,37 @@
+# Пример конфигурационного файла telethon_config.toml
+# Скопируйте этот файл в telethon_config.toml и заполните своими данными
+
+# Получить api_id и api_hash можно на https://my.telegram.org
+api_id = 12345678
+api_hash = "0123456789abcdef0123456789abcdef"
+
+# Название сессии (сохраняется в forward_session.session)
+session = "forward_session"
+
+# Источник: юзернейм (@channel), ссылка (t.me/chat), числовой ID (-1001234567890)
+source = "@source_channel"
+
+# Получатель: юзернейм (@my_backup), 'me' (Избранное / Saved Messages), или ID
+target = "@target_channel"
+
+# Хронологический порядок: от старых к новым (true) или от новых к старым (false)
+reverse = true
+
+# Пауза между отправками в секундах (защита от FloodWait)
+delay = 1.0
+
+# Размер пачки сообщений при нативной пересылке (1-100)
+batch_size = 20
+
+# Режим: false = нативная пересылка («Переслано от»), true = копирование контента
+no_forward = false
+
+# Режим тестирования без реальной отправки сообщений
+dry_run = false
+
+# Ограничение количества сообщений (null = все)
+# limit = 500
+
+# Фильтры по дате (в формате YYYY-MM-DD или YYYY-MM-DD HH:MM:SS)
+# from_date = "2024-01-01"
+# to_date = "2024-12-31"

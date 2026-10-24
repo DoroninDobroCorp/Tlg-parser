@@ -2,6 +2,9 @@ pyautogui>=0.9.54
 pillow>=10.3.0
 imagehash>=4.3.1
 pynput>=1.7.6
-# macOS: для управления мышью/клавиатурой и скриншотов через Quartz
-pyobjc>=10.1
+# macOS: точечные зависимости Quartz/Cocoa для pyautogui вместо тяжелого метапакета pyobjc
+pyobjc-core>=10.1; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.1; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.1; sys_platform == "darwin"
 telethon>=1.34.0
+tomli>=2.0.1; python_version < "3.11"

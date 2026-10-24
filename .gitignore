@@ -12,7 +12,9 @@ env/
 
 # Local data/output
 screenshots/
+*.session*
 forward_session*
+.forward_checkpoint*
 telethon_config.toml
 
 # IDE/editor
